@@ -5,20 +5,20 @@ import (
 	"log"
 	"time"
 
-	"go-broker/broker" // مسیر ایمپورت بر اساس ساختار پروژه شما
+	"github.com/mrjvadi/go-broker/broker" // مسیر ایمپورت بر اساس ساختار پروژه شما
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6380"})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Could not connect to Redis: %v", err)
 	}
 
 	// برای ارسال، ما از همان ساختار App استفاده می‌کنیم اما متد Run آن را صدا نمی‌زنیم
 	// پارامترهای group و maxJobs در اینجا اهمیتی ندارند
-	clientApp := broker.New(rdb, "task_queue", "main_processing_group", 0, 1000)
+	clientApp := broker.New(rdb, "task_queue", "main_processing_group", broker.WithMaxJobs(5), broker.WithStreamLength(1000))
 
 	log.Println("--- Sending messages to the worker ---")
 

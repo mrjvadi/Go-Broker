@@ -1,4 +1,4 @@
-module github.com/mrjvadi/go-messaging-framework
+module github.com/mrjvadi/go-broker
 
 go 1.24.4
 

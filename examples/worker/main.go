@@ -3,12 +3,11 @@ package main
 import (
 	"context"
 	"log"
-	"os"
 	"os/signal"
 	"syscall"
 
-	"go-broker/broker" // مسیر ایمپورت بر اساس ساختار پروژه شما
-	"go-broker/examples/handlers"
+	"github.com/mrjvadi/go-broker/broker" // مسیر ایمپورت بر اساس ساختار پروژه شما
+	"github.com/mrjvadi/go-broker/examples/handlers"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
@@ -19,7 +18,7 @@ func main() {
 	defer stop()
 
 	// اتصال به Redis
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6380"})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Could not connect to Redis: %v", err)
 	}
@@ -30,13 +29,13 @@ func main() {
 
 	// ساخت اپلیکیشن ورکر با تنظیمات سفارشی
 	appInstance := broker.New(rdb, "task_queue", "main_processing_group",
-		broker.WithLogger(logger),         // لاگر سفارشی
-		broker.WithMaxJobs(20),            // حداکثر ۲۰ کار همزمان
-		broker.WithStreamLength(1000),     // نگهداری ۱۰۰۰ پیام آخر در صف
+		broker.WithLogger(logger),     // لاگر سفارشی
+		broker.WithMaxJobs(20),        // حداکثر ۲۰ کار همزمان
+		broker.WithStreamLength(1000), // نگهداری ۱۰۰۰ پیام آخر در صف
 	)
 
 	// --- گروه‌بندی و ثبت پردازشگرها ---
-	
+
 	// گروه برای تمام کارهای مربوط به سفارشات
 	orderGroup := appInstance.Group("orders")
 	orderGroup.OnTask("PROCESS", handlers.ProcessNewOrder)
