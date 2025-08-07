@@ -5,14 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"os"
-	"sync"
-	"time"
-
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"os"
+	"sync"
+	"time"
 )
 
 // App ساختار اصلی و مرکزی فریمورک است.
@@ -122,8 +120,8 @@ func (a *App) Request(ctx context.Context, taskType string, payload interface{},
 }
 
 // --- متدهای ثبت پردازشگر در سطح App ---
-func (a *App) OnTask(taskType string, handler HandlerFunc)     { a.taskHandlers[taskType] = handler }
-func (a *App) OnEvent(channel string, handler HandlerFunc)     { a.eventHandlers[channel] = handler }
+func (a *App) OnTask(taskType string, handler HandlerFunc)       { a.taskHandlers[taskType] = handler }
+func (a *App) OnEvent(channel string, handler HandlerFunc)       { a.eventHandlers[channel] = handler }
 func (a *App) OnRequest(taskType string, handler RPCHandlerFunc) { a.rpcHandlers[taskType] = handler }
 
 // --- متدهای ثبت پردازشگر در سطح Group ---
