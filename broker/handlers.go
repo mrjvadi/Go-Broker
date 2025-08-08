@@ -1,7 +1,8 @@
 package broker
 
-// HandlerFunc یک نوع داده برای تمام توابع پردازشگر یک‌طرفه است.
+// HandlerFunc برای Tasks / Events
 type HandlerFunc func(c *Context) error
 
-// RPCHandlerFunc یک نوع داده برای پردازشگرهای درخواست/پاسخ است.
-type RPCHandlerFunc func(c *Context) (response interface{}, err error)
+// RPCHandlerFunc: پاسخ خام []byte
+// اگر JSON می‌خوای، در هندلر از c.Bind(...) استفاده کن و خروجی را خودت JSON کن.
+type RPCHandlerFunc func(c *Context) ([]byte, error)

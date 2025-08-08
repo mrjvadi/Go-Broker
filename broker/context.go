@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 )
 
-// Context یک پوشش دور پیام‌های دریافتی است و متدهای کمکی را ارائه می‌دهد.
+// Context داده‌های پیام و کمک‌متدها
 type Context struct {
 	ctx     context.Context
 	app     *App
@@ -13,12 +13,12 @@ type Context struct {
 	msgID   string
 }
 
-// Bind محتوای پیام (payload) را در یک ساختار (struct) می‌ریزد.
+// Bind: payload را داخل ساختار v دیکد می‌کند (اگر JSON باشد)
 func (c *Context) Bind(v interface{}) error {
 	return json.Unmarshal(c.payload, v)
 }
 
-// Ctx کانتکست اصلی Go را برمی‌گرداند.
+// Ctx: کانتکست اصلی را برمی‌گرداند
 func (c *Context) Ctx() context.Context {
 	return c.ctx
 }
