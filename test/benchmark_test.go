@@ -12,12 +12,24 @@ import (
 	"github.com/mrjvadi/go-broker/broker"
 )
 
+func newRedisClient(addr string, db int, poolSize, minIdle int, readTimeout time.Duration) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		DB:           db,
+		PoolSize:     poolSize,    // پیشنهاد: ≈ 2× همزمانی
+		MinIdleConns: minIdle,     // کانکشن‌های گرم
+		ReadTimeout:  readTimeout, // روی Pub/Sub: 0 (بدون deadline)
+		WriteTimeout: 200 * time.Millisecond,
+		// MaxRetries: 1, // اگر می‌خوای سخت‌گیر باشه
+	})
+}
+
 func newBrokerForBench(b *testing.B) (context.Context, context.CancelFunc, *redis.Client, *broker.App, string, string) {
 	b.Helper()
 
-	addr := getenv("REDIS_ADDR", "localhost:6380")
+	addr := getenv("REDIS_ADDR", "localhost:6379")
 	db := getenvInt("REDIS_DB", 15) // DB جدا برای بنچ
-	rdb := redis.NewClient(&redis.Options{Addr: addr, DB: db})
+	rdb := newRedisClient(addr, db, 512, 128, 200*time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -54,7 +66,6 @@ func newBrokerForBench(b *testing.B) (context.Context, context.CancelFunc, *redi
 
 // ------------------------------------------------------------
 // Benchmark 1: Task – Throughput (enqueue N و صبر برای مصرف همه)
-// این بنچ مارک متوسط زمان/پیام را بر اساس مجموع زمان تا مصرف همه پیام‌ها می‌دهد.
 // ------------------------------------------------------------
 func BenchmarkTask_Throughput(b *testing.B) {
 	ctx, _, _, br, _, _ := newBrokerForBench(b)
@@ -65,11 +76,12 @@ func BenchmarkTask_Throughput(b *testing.B) {
 		select {
 		case done <- struct{}{}:
 		default:
-			// اگر پر شد، همون‌طور ادامه می‌دهیم تا نویز ایجاد نشه
+			// اگر پر شد، ادامه بده تا نویز ایجاد نشه
 		}
 		return nil
 	})
 
+	// Run بلوکه است؛ در تست با goroutine بالا می‌آید
 	go br.Run(ctx)
 	time.Sleep(150 * time.Millisecond) // فرصت برای ready شدن consumer
 
@@ -101,7 +113,6 @@ func BenchmarkTask_Throughput(b *testing.B) {
 
 // ------------------------------------------------------------
 // Benchmark 2: Task – Parallel (E2E)
-// برای هر iteration: enqueue و منتظر مصرف همان iteration می‌مانیم (توکن از done).
 // ------------------------------------------------------------
 func BenchmarkTask_Parallel(b *testing.B) {
 	ctx, _, _, br, _, _ := newBrokerForBench(b)
@@ -141,14 +152,18 @@ func BenchmarkTask_Parallel(b *testing.B) {
 func BenchmarkRPC_Parallel(b *testing.B) {
 	ctx := context.Background()
 
-	addr := getenv("REDIS_ADDR", "localhost:6380")
+	addr := getenv("REDIS_ADDR", "localhost:6379")
 	db := getenvInt("REDIS_DB", 15)
 
-	// دو کلاینت جدا برای سرور و کلاینت
-	rdbSrv := redis.NewClient(&redis.Options{Addr: addr, DB: db})
-	rdbCli := redis.NewClient(&redis.Options{Addr: addr, DB: db})
+	// دو کلاینت جدا برای سرور و کلاینت، با Pool مناسب
+	rdbSrv := newRedisClient(addr, db, 256, 64, 200*time.Millisecond) // سرور
+	rdbCli := newRedisClient(addr, db, 256, 64, 0)                    // کلاینت Pub/Sub → ReadTimeout=0
 
-	b.Cleanup(func() { _ = rdbSrv.Close(); _ = rdbCli.Close() })
+	// بستن کلاینت‌ها در انتها
+	b.Cleanup(func() {
+		_ = rdbSrv.Close()
+		_ = rdbCli.Close()
+	})
 
 	if err := rdbSrv.Ping(ctx).Err(); err != nil {
 		b.Fatalf("redis (srv) ping failed: %v", err)
@@ -181,23 +196,25 @@ func BenchmarkRPC_Parallel(b *testing.B) {
 	brCli := broker.New(
 		rdbCli, stream, group,
 		broker.WithMaxJobs(64),
-		broker.WithStreamLength(100_000),
+		broker.WithStreamLength(100_000), // ✅ اصلاح اشتباه تایپی
 	)
 
 	// بالا آوردن سرور
 	serverCtx, cancel := context.WithCancel(ctx)
+	// ترتیبِ صحیحِ بستن‌ها: اول اپ کلاینت (بستن Pub/Sub)، بعد کلاینت Redis
 	b.Cleanup(func() {
 		cancel()
-		_ = brCli.Close()  // اول PubSub بسته شود
-		_ = rdbCli.Close() // بعد Redis client
+		_ = brCli.Close() // سابسکرایبر reply:* بسته شود
+		_ = rdbCli.Close()
 	})
+
 	go brSrv.Run(serverCtx)
 
 	// کمی صبر تا سرور آماده شنونده‌ها بشه
 	time.Sleep(250 * time.Millisecond)
 
-	// Warm-up: هم subscribe کلاینت تثبیت می‌شه هم مسیر رفت/برگشت
-	if _, err := brCli.Request(ctx, "GET_INFO", []byte("ping"), 3*time.Second); err != nil {
+	// Warm-up: تثبیت سابسکرایبر و مسیر رفت/برگشت
+	if _, err := brCli.Request(ctx, "GET_INFO", []byte("ping"), 5*time.Second); err != nil {
 		b.Fatalf("warmup rpc failed: %v", err)
 	}
 
@@ -209,7 +226,6 @@ func BenchmarkRPC_Parallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			if _, err := brCli.Request(ctx, "GET_INFO", reqPayload, timeout); err != nil {
-				// در بنچ به خطا حساسیم؛ سریع fail بده
 				b.Fatalf("rpc request failed: %v", err)
 			}
 		}

@@ -2,40 +2,76 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
-	"github.com/mrjvadi/go-broker/broker" // مسیر ایمپورت بر اساس ساختار پروژه شما
+	"github.com/mrjvadi/go-broker/broker"
 	"github.com/redis/go-redis/v9"
 )
 
+type Order struct {
+	ID     int    `json:"id"`
+	UserID int    `json:"user_id"`
+	Title  string `json:"title"`
+}
+
 func main() {
+	// اگر می‌خوای از RequestFast استفاده کنی، بهتره ReadTimeout=0 باشه تا Pub/Sub قطع نشه
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         "127.0.0.1:6379",
+		DB:           0,
+		PoolSize:     128,
+		MinIdleConns: 16,
+		ReadTimeout:  0, // برای Fast مفیده
+		WriteTimeout: 200 * time.Millisecond,
+	})
+	defer rdb.Close()
+
+	// کلاینت نیازی به هندلر ندارد (می‌تونی داشته باشی ولی معمولاً نه)
+	app := broker.New(
+		rdb,
+		"app_stream",
+		"app_group",
+		broker.WithMaxJobs(32),
+		broker.WithStreamLength(100_000),
+	)
+
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6380"})
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Could not connect to Redis: %v", err)
+	orders := app.Group("orders")
+
+	// 1) Task: enqueue
+	if _, err := orders.Enqueue(ctx, "create", Order{
+		ID: 101, UserID: 7, Title: "First order",
+	}); err != nil {
+		log.Fatalf("enqueue failed: %v", err)
+	}
+	fmt.Println("task enqueued")
+
+	// 2) Event: publish
+	if err := orders.Publish(ctx, "events", map[string]any{
+		"type": "created",
+		"id":   101,
+	}); err != nil {
+		log.Fatalf("publish failed: %v", err)
+	}
+	fmt.Println("event published")
+
+	// 3) RPC (Reliable): هیچ پاسخی گم نمی‌شود؛ برای هر درخواست یک SUBSCRIBE موقتی
+	{
+		respBytes, err := app.Request(ctx, "user.get", map[string]int{"id": 42}, 5*time.Second)
+		if err != nil {
+			log.Fatalf("RPC reliable failed: %v", err)
+		}
+		fmt.Printf("RPC reliable response: %s\n", string(respBytes))
 	}
 
-	// برای ارسال، ما از همان ساختار App استفاده می‌کنیم اما متد Run آن را صدا نمی‌زنیم
-	// پارامترهای group و maxJobs در اینجا اهمیتی ندارند
-	clientApp := broker.New(rdb, "task_queue", "main_processing_group", broker.WithMaxJobs(5), broker.WithStreamLength(1000))
-
-	log.Println("--- Sending messages to the worker ---")
-
-	// ارسال یک کار حیاتی به گروه "orders"
-	clientApp.Enqueue(ctx, "orders.PROCESS", map[string]string{"id": "ORD-555-123"})
-	log.Println("Enqueued: Task 'orders.PROCESS'")
-
-	// ارسال یک رویداد آنی به گروه "users"
-	clientApp.Publish(ctx, "users.login", map[string]string{"username": "Bob"})
-	log.Println("Published: Event 'users.login'")
-
-	// ارسال یک درخواست RPC به گروه "users" و انتظار برای پاسخ
-	log.Println("Sending: RPC request 'users.GET_INFO'")
-	resp, err := clientApp.Request(ctx, "users.GET_INFO", map[string]int{"id": 101}, 5*time.Second)
-	if err != nil {
-		log.Printf("RPC Request failed: %v\n", err)
-	} else {
-		log.Printf("RPC Response received: %s\n", string(resp))
+	// 4) RPC (Fast / Best-Effort): سریع‌تر، ولی ممکن است در شرایط نادر گم شود
+	{
+		respBytes, err := app.RequestFast(ctx, "user.get", map[string]int{"id": 43}, 5*time.Second)
+		if err != nil {
+			log.Fatalf("RPC fast failed: %v", err)
+		}
+		fmt.Printf("RPC fast response: %s\n", string(respBytes))
 	}
 }

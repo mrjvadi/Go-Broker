@@ -5,20 +5,11 @@ import (
 	"encoding/json"
 )
 
-// Context داده‌های پیام و کمک‌متدها
 type Context struct {
 	ctx     context.Context
-	app     *App
 	payload []byte
-	msgID   string
 }
 
-// Bind: payload را داخل ساختار v دیکد می‌کند (اگر JSON باشد)
-func (c *Context) Bind(v interface{}) error {
-	return json.Unmarshal(c.payload, v)
-}
-
-// Ctx: کانتکست اصلی را برمی‌گرداند
-func (c *Context) Ctx() context.Context {
-	return c.ctx
-}
+func (c *Context) Bind(v any) error     { return json.Unmarshal(c.payload, v) }
+func (c *Context) Ctx() context.Context { return c.ctx }
+func (c *Context) Payload() []byte      { return c.payload }

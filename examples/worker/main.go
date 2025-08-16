@@ -2,52 +2,100 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/mrjvadi/go-broker/broker" // مسیر ایمپورت بر اساس ساختار پروژه شما
-	"github.com/mrjvadi/go-broker/examples/handlers"
+	"github.com/mrjvadi/go-broker/broker"
 	"github.com/redis/go-redis/v9"
-	"go.uber.org/zap"
 )
 
+type Order struct {
+	ID     int    `json:"id"`
+	UserID int    `json:"user_id"`
+	Title  string `json:"title"`
+}
+
 func main() {
-	// ساخت یک context که با سیگنال سیستم (Ctrl+C) لغو می‌شود تا خاموش شدن امن را مدیریت کند
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	// Redis برای سرور: نیازی به تغییر ReadTimeout نیست
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         "127.0.0.1:6379",
+		DB:           0,
+		PoolSize:     128,
+		MinIdleConns: 16,
+	})
+	defer rdb.Close()
 
-	// اتصال به Redis
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6380"})
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Could not connect to Redis: %v", err)
-	}
-
-	// ساخت لاگر ساختاریافته برای محیط پروداکشن
-	logger, _ := zap.NewProduction()
-	defer logger.Sync()
-
-	// ساخت اپلیکیشن ورکر با تنظیمات سفارشی
-	appInstance := broker.New(rdb, "task_queue", "main_processing_group",
-		broker.WithLogger(logger),     // لاگر سفارشی
-		broker.WithMaxJobs(20),        // حداکثر ۲۰ کار همزمان
-		broker.WithStreamLength(1000), // نگهداری ۱۰۰۰ پیام آخر در صف
+	app := broker.New(
+		rdb,
+		"app_stream", // اسم استریم
+		"app_group",  // اسم گروه مصرف‌کننده
+		broker.WithMaxJobs(64),
+		broker.WithStreamLength(100_000),
 	)
 
-	// --- گروه‌بندی و ثبت پردازشگرها ---
+	orders := app.Group("orders")
 
-	// گروه برای تمام کارهای مربوط به سفارشات
-	orderGroup := appInstance.Group("orders")
-	orderGroup.OnTask("PROCESS", handlers.ProcessNewOrder)
+	// Task handler
+	orders.OnTask("create", func(c *broker.Context) error {
+		var o Order
+		if err := c.Bind(&o); err != nil {
+			log.Printf("[TASK orders.create] bind err: %v", err)
+			return err
+		}
+		// شبیه‌سازی پردازش
+		time.Sleep(5 * time.Millisecond)
+		log.Printf("[TASK orders.create] processed order: %+v", o)
+		return nil
+	})
 
-	// گروه برای تمام رویدادها و درخواست‌های مربوط به کاربران
-	userGroup := appInstance.Group("users")
-	userGroup.OnEvent("login", handlers.LogUserLogin)
-	userGroup.OnRequest("GET_INFO", handlers.GetUserInfo)
+	// Event handler (Pub/Sub)
+	orders.OnEvent("events", func(c *broker.Context) error {
+		var m map[string]any
+		_ = c.Bind(&m) // اختیاری
+		log.Printf("[EVENT orders.events] got: %s", string(c.Payload()))
+		return nil
+	})
 
-	log.Println("Starting worker server...")
-	// اجرای فریمورک (این متد تا زمان دریافت سیگنال خروج، بلاک می‌شود)
-	appInstance.Run(ctx)
+	// RPC handler (Reliable/ Fast فرقی برای سرور ندارد)
+	app.OnRequest("user.get", func(c *broker.Context) ([]byte, error) {
+		var req struct {
+			ID int `json:"id"`
+		}
+		_ = c.Bind(&req)
+		resp := map[string]any{
+			"id":    req.ID,
+			"name":  "Alice",
+			"email": "alice@example.com",
+		}
+		// پاسخ باید []byte (JSON) باشد؛ app خودش envelope می‌کند
+		return mustJSON(resp), nil
+	})
 
-	log.Println("Worker server shut down gracefully.")
+	// graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	log.Println("server running …")
+	app.Run(ctx) // بلوکه می‌شود تا سیگنال برسد
+	log.Println("server stopped")
+}
+
+func mustJSON(v any) []byte {
+	b, _ := jsonMarshal(v)
+	return b
+}
+
+// از json استاندارد استفاده کن (اینجا فقط برای کوتاه‌نویسی)
+func jsonMarshal(v any) ([]byte, error) {
+	type m = map[string]any
+	switch vv := v.(type) {
+	case []byte:
+		return vv, nil
+	default:
+		return json.Marshal(v)
+	}
 }
