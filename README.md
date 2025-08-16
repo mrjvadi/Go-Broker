@@ -1,326 +1,233 @@
-# Go-Broker (v1.0.1)
+# Go-Broker
 
-فریم‌ورک سبک پیام‌رسانی برای Go با تکیه بر **Redis Streams** و **Pub/Sub**. این README فقط بر اساس کدهای دایرکتوری `` در تگ **v1.0.1** نوشته شده و نمونه‌های قدیمی (`examples/`) عمداً نادیده گرفته شده‌اند.
+پیام‌بر سبک برای Go با Redis (Streams + Pub/Sub)
 
----
+این پکیج یک «اپ پیام‌محور» ساده می‌سازد که سه الگوی اصلی را پوشش می‌دهد:
 
-## فهرست مطالب
+- **Task**‌: صفِ کارها روی Redis Stream (تک‌مصرفی با consumer-group)
+- **Event**‌: رویدادهای fan-out با Pub/Sub
+- **RPC**‌: درخواست/پاسخ (درخواست روی Stream، پاسخ روی Pub/Sub)
 
-- امکانات کلیدی
-- معماری اجمالی
-- پیش‌نیازها
-- نصب و ایمپورت
-- بیلد و اجرا (محلی/کانتینر)
-- شروع سریع (ورکر و کلاینت)
-- مرجع API (امضاهای واقعی)
-- الگوها و رفتارها (Tasks / Events / RPC)
-- Options (پیکربندی در v1.0.1)
-- Namespacing با Group
-- نکات مهم دربارهٔ پایداری، همزمانی و توقف
-- یادداشت دربارهٔ examples/
-- مشارکت و لایسنس
+> نکته‌ی کلیدی: خودِ `App.Run(ctx)` **بلوکه** می‌ماند؛ هندلرها به‌صورت خودکار در **goroutine** با سقف همزمانی اجرا می‌شوند.
 
 ---
 
-## امکانات کلیدی
-
-- **Tasks (پایدار روی Streams):** خواندن با Consumer Group و تصدیق (ACK) پس از اجرای هندلر.
-- **Events (غیرپایدار روی Pub/Sub):** دریافت زندهٔ پیام‌ها فقط وقتی مشترک هستید.
-- **Request/Response (RPC):** ارسال درخواست روی Stream و دریافت پاسخ روی یک کانال Pub/Sub اختصاصیِ درون‌برنامه‌ای.
-- **همزمانی کنترل‌شده:** محدودسازی پردازش موازی با بافر کانال داخلی.
-- **لاگینگ اختیاری با zap:** تزریق `*zap.Logger`.
-
----
-
-## معماری اجمالی
-
-```
-Client -- Enqueue --> Redis Stream <streamName> --(Group:<groupName>)--> Workers (Tasks)
-Client -- Publish --> Redis Pub/Sub <channel> ------------------------------> Subscribers (Events)
-Client -- Request --> Redis Stream <streamName> --(RPC handler)--> Worker -- Publish --> reply:<uuid>
-```
-
----
-
-## پیش‌نیازها
-
-- Go 1.20+
-- Redis 6+
-- ماژول‌ها: `github.com/redis/go-redis/v9`, `go.uber.org/zap`
-
----
-
-## نصب و ایمپورت
+## نصب
 
 ```bash
-go get github.com/mrjvadi/Go-Broker@v1.0.1
+go get github.com/mrjvadi/go-broker@latest
 ```
 
-```go
-import (
-    "github.com/mrjvadi/Go-Broker/broker"
-    redis "github.com/redis/go-redis/v9"
-    "go.uber.org/zap"
-)
+پیش‌نیاز: Redis 6+ (پیشنهادی 7)
+
+برای اجرای محلی:
+
+```bash
+docker run --rm -p 6379:6379 redis:7
 ```
 
 ---
 
-## بیلد و اجرا
+## شروع سریع
 
-> **نکته:** فولدر `examples/` قدیمی است—کدهای زیر را مستقیم در اپ خود استفاده کنید.
-
-### اجرای محلی
-
-1. Redis:
-
-```bash
-docker run -d --name redis -p 6379:6379 redis:7-alpine
-```
-
-2. اجرای برنامهٔ خودتان:
-
-```bash
-# در پوشهٔ پروژه‌تان
-go mod init myapp
-go get github.com/mrjvadi/Go-Broker@v1.0.1
-go run .
-```
-
-3. بیلد باینری:
-
-```bash
-go build -o myworker .
-```
-
-### Dockerfile مینیمال
-
-```dockerfile
-FROM golang:1.22 AS build
-WORKDIR /app
-COPY . .
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/myworker .
-
-FROM gcr.io/distroless/base-debian12
-COPY --from=build /out/myworker /myworker
-ENTRYPOINT ["/myworker"]
-```
-
----
-
-## شروع سریع (ورکر)
+### سرور (Consumer)
 
 ```go
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "log"
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-    "github.com/mrjvadi/Go-Broker/broker"
-    redis "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9"
+	"github.com/mrjvadi/go-broker/broker"
 )
 
-type NewOrder struct {
-    ID string `json:"id"`
-}
-
-type UserReq struct {
-    ID int `json:"id"`
-}
-
-type UserResp struct {
-    ID   int    `json:"id"`
-    Name string `json:"name"`
+type Order struct {
+	ID     int    `json:"id"`
+	UserID int    `json:"user_id"`
+	Title  string `json:"title"`
 }
 
 func main() {
-    ctx := context.Background()
-    rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	defer rdb.Close()
 
-    app := broker.New(rdb, "task_queue", "main_group") // گزینه‌ها در بخش Options
+	app := broker.New(rdb, "app_stream", "app_group",
+		broker.WithMaxJobs(64),
+		broker.WithStreamLength(100_000),
+	)
 
-    // Task handler (payload را JSON بایند کنید)
-    app.OnTask("NEW_ORDER", func(c *broker.Context) error {
-        var in NewOrder
-        if err := c.Bind(&in); err != nil { return err }
-        log.Println("processing NEW_ORDER:", in.ID)
-        return nil
-    })
+	orders := app.Group("orders")
 
-    // Event handler (payload خام []byte است—در صورت نیاز JSON بایند کنید)
-    app.OnEvent("user_events", func(c *broker.Context) error {
-        log.Println("user event payload:", string(cPayload(c)))
-        return nil
-    })
+	// Task handler
+	orders.OnTask("create", func(c *broker.Context) error {
+		var o Order
+		_ = c.Bind(&o)
+		log.Printf("[TASK orders.create] %+v", o)
+		return nil
+	})
 
-    // RPC handler: خروجی باید []byte باشد
-    app.OnRequest("GET_USER_INFO", func(c *broker.Context) ([]byte, error) {
-        var req UserReq
-        if err := c.Bind(&req); err != nil { return nil, err }
-        out := UserResp{ID: req.ID, Name: "Alice"}
-        return json.Marshal(out)
-    })
+	// Event handler (Pub/Sub)
+	orders.OnEvent("events", func(c *broker.Context) error {
+		log.Printf("[EVENT orders.events] %s", string(c.Payload()))
+		return nil
+	})
 
-    app.Run(ctx) // با لغو ctx متوقف می‌شود
+	// RPC handler (سرور برای هر دو مود یکسان است)
+	app.OnRequest("user.get", func(c *broker.Context) ([]byte, error) {
+		return []byte(`{"id":42,"name":"Alice"}`), nil
+	})
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	log.Println("server running …")
+	app.Run(ctx) // بلوکه تا زمان سیگنال
 }
-
-func cPayload(c *broker.Context) []byte { var v struct{}; return (*struct{ P []byte })(nil).P }
 ```
 
-> در هندلرها از `c.Bind(&T)` برای دیکد JSON استفاده کنید. در RPC، پاسخ را خودتان `json.Marshal` کنید و برگردانید.
-
-### ارسال پیام از سرویس دیگر
+### کلاینت (Reliable و Fast)
 
 ```go
 package main
 
 import (
-    "context"
-    "encoding/json"
-    "fmt"
-    "time"
+	"context"
+	"fmt"
+	"time"
 
-    "github.com/mrjvadi/Go-Broker/broker"
-    redis "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9"
+	"github.com/mrjvadi/go-broker/broker"
 )
 
 func main() {
-    ctx := context.Background()
-    rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-    client := broker.New(rdb, "task_queue", "main_group")
+	rdb := redis.NewClient(&redis.Options{
+		Addr:        "127.0.0.1:6379",
+		ReadTimeout: 0, // برای مود Fast بهتر است 0 باشد
+	})
+	defer rdb.Close()
 
-    // 1) Task
-    _ = client.Enqueue(ctx, "NEW_ORDER", map[string]any{"id": "ORD-12345"})
+	app := broker.New(rdb, "app_stream", "app_group",
+		broker.WithMaxJobs(32),
+	)
 
-    // 2) Event
-    _ = client.Publish(ctx, "user_events", map[string]any{"username": "alice"})
+	ctx := context.Background()
 
-    // 3) RPC (timeout اختیاری؛ پیش‌فرض اگر <=0 باشد، 5s)
-    body, err := client.Request(ctx, "GET_USER_INFO", map[string]any{"id": 99}, 3*time.Second)
-    if err != nil { panic(err) }
-    var resp map[string]any
-    _ = json.Unmarshal(body, &resp)
-    fmt.Println("RPC response:", resp)
+	// 1) Task
+	_, _ = app.Group("orders").Enqueue(ctx, "create", map[string]any{"id": 101, "user_id": 7, "title": "first"})
+
+	// 2) Event
+	_ = app.Group("orders").Publish(ctx, "events", map[string]any{"type": "created", "id": 101})
+
+	// 3) RPC — حالت قابل اعتماد (Reliable)
+	resp1, err := app.Request(ctx, "user.get", map[string]int{"id": 42}, 5*time.Second)
+	fmt.Println("reliable:", string(resp1), err)
+
+	// 4) RPC — حالت سریع/Best-Effort (Fast)
+	resp2, err := app.RequestFast(ctx, "user.get", map[string]int{"id": 43}, 5*time.Second)
+	fmt.Println("fast:", string(resp2), err)
 }
 ```
 
 ---
 
-## مرجع API (امضاهای واقعی)
+## مفاهیم و طراحی
+
+- **Stream + Group**: پیام‌های Task/RPC روی Redis Stream ذخیره می‌شوند و با `XREADGROUP` خوانده می‌شوند. هر `App` یک `stream` و یک `group` دارد.
+- **Task**: پیام یک‌بار مصرف است؛ پس از اجرای موفق، `XACK` می‌شود.
+- **Event**: روی کانال Pub/Sub منتشر می‌شود؛ همه‌ی مشترک‌ها دریافت می‌کنند.
+- **RPC**: درخواست روی Stream، پاسخ روی Pub/Sub با کانال `reply:<correlation_id>`.
+- **Goroutine handlers**: هر پیام/رویداد در goroutine اجرا می‌شود؛ سقف همزمانی با `WithMaxJobs(n)`.
+- **Group(prefix)**: برای namespacing؛ مثلاً `Group("orders").OnTask("create", ...)` معادل نام کامل `orders.create` است.
+
+---
+
+## API خلاصه
 
 ```go
-// سازنده
-func New(client *redis.Client, stream, group string, options ...Option) *App
+app := broker.New(rdb, streamName, groupName, opts...)
 
-// ارسال
-func (a *App) Enqueue(ctx context.Context, taskType string, payload interface{}) (string, error)
-func (a *App) Publish(ctx context.Context, channel string, payload interface{}) error
-func (a *App) Request(ctx context.Context, taskType string, payload interface{}, timeout time.Duration) ([]byte, error)
+app.Run(ctx)                          // اجرای بلوکه‌شونده
+app.Close()                           // بستن Subscriberها و انتظار برای کارهای درحال انجام
 
-// ثبت هندلرها
-func (a *App) OnTask(taskType string, handler HandlerFunc)
-func (a *App) OnEvent(channel string, handler HandlerFunc)
-func (a *App) OnRequest(taskType string, handler RPCHandlerFunc)
+app.OnTask(name, HandlerFunc)         // ثبت Task handler
+app.OnEvent(channel, HandlerFunc)     // ثبت Event handler (Pub/Sub)
+app.OnRequest(name, RPCHandlerFunc)   // ثبت RPC handler
 
-// اجرا و توقف
-func (a *App) Run(ctx context.Context)
-func (a *App) Close() error
+app.Enqueue(ctx, name, payload)       // ارسال Task روی Stream
+app.Publish(ctx, channel, payload)    // انتشار Event روی Pub/Sub
+
+// RPC — دو مود:
+app.Request(ctx, name, payload, timeout)       // Reliable (هر درخواست یک Subscribe موقتی)
+app.RequestFast(ctx, name, payload, timeout)   // Fast/Best-Effort (PSubscribe سراسری)
 
 // Namespacing
-func (a *App) Group(prefix string) *Group
-
-// انواع هندلر و کانتکست
-type HandlerFunc func(c *Context) error
-type RPCHandlerFunc func(c *Context) ([]byte, error)
-
-// Context
-func (c *Context) Bind(v interface{}) error
-func (c *Context) Ctx() context.Context
+orders := app.Group("orders")
+orders.OnTask("create", h)
+orders.Publish(ctx, "events", data)
+orders.Request(ctx, "get", req, 3*time.Second)
 ```
 
----
+**Options**:
 
-## الگوها و رفتارها
-
-### Tasks (Streams)
-
-- پیام با فیلدهای `type` و `payload` به استریم `streamName` افزوده می‌شود. اگر `WithStreamLength` فعال شده باشد، با **MAXLEN \~ N** تقریباً تریم می‌شود.
-- مصرف با `XREADGROUP` و `Consumer = <hostname>-<pid>`.
-- **ACK همیشه بعد از اجرای هندلر انجام می‌شود، حتی اگر خطا برگردانید.** بنابراین **ریتراِی خودکار داخلی وجود ندارد** و در صورت نیاز باید خودتان پیام را مجدداً صف کنید/لاگ کنید.
-- در این نسخه **Claim خودکار پیام‌های Pending** پیاده‌سازی نشده است.
-
-### Events (Pub/Sub)
-
-- فقط کانال‌هایی که برایشان `OnEvent` ثبت شده، Subscribe می‌شوند.
-- پیام‌ها غیرپایدارند؛ اگر آنلاین نباشید، از دست می‌روند.
-
-### Request/Response (RPC)
-
-- درخواست به Stream می‌رود و پاسخ روی یک کانال Pub/Sub اختصاصی به شکل **envelope** برمی‌گردد:
-  ```json
-  {"correlation_id":"...","body":"<raw bytes>","error":""}
-  ```
-- هندلر RPC باید `[]byte` برگرداند. برای JSON، خودتان `json.Marshal` کنید.
-- اگر `timeout <= 0` باشد، **۵ ثانیه** در نظر گرفته می‌شود.
+- `WithMaxJobs(n int)` — سقف همزمانی اجرای هندلرها.
+- `WithStreamLength(n int64)` — محدود کردن طول تقریبی stream (با Trim approximate).
+- `WithLogger(*zap.Logger)` — لاگر سفارشی (اختیاری).
 
 ---
 
-## Options (v1.0.1)
+## نکات پایداری و عملکرد
 
-> پترن Functional Options برای پیکربندی اولیهٔ `App`.
+- برای کلاینتی که از `` استفاده می‌کند، `ReadTimeout` را **۰** بگذار تا Pub/Sub قطع و وصل نشود.
+- ترتیب بستن‌ها:
+  1. کلاینت: **اول** `app.Close()` سپس `redisClient.Close()`
+  2. سرور: روی سیگنال، `Run(ctx)` به‌صورت تمیز خارج می‌شود.
+- برای بار بالا، `PoolSize` و `MinIdleConns` را افزایش بده.
+- برای JSON کم‌هزینه‌تر می‌توان از `[]byte` مستقیم یا کتابخانه‌ی سریع‌تر استفاده کرد.
 
-| نام گزینه          | امضا                       | پیش‌فرض        | توضیح                                                                 |
-| ------------------ | -------------------------- | -------------- | --------------------------------------------------------------------- |
-| `WithLogger`       | `func(*zap.Logger) Option` | `zap.NewNop()` | تزریق لاگر سفارشی.                                                    |
-| `WithMaxJobs`      | `func(int) Option`         | `10`           | بیشینهٔ Jobهای همزمان (بافر کانال داخلی). فقط اگر `n>0` تنظیم می‌شود. |
-| `WithStreamLength` | `func(int64) Option`       | `0` (غیرفعال)  | اگر `>0` باشد، افزودن با `MAXLEN ~ N` انجام می‌شود (تریم تقریبی).     |
+---
 
-نمونهٔ استفاده:
+## بنچمارک‌ها
 
-```go
-logr, _ := zap.NewProduction()
-app := broker.New(rdb, "task_queue", "main_group",
-    broker.WithLogger(logr),
-    broker.WithMaxJobs(32),
-    broker.WithStreamLength(100_000),
-)
+اجرای بنچ‌های نمونه:
+
+```bash
+go test ./test -bench . -run ^$
 ```
 
----
+متغیرهای محیطی (اختیاری):
 
-## Namespacing با Group
+- `REDIS_ADDR` (پیش‌فرض: `localhost:6379`)
+- `REDIS_DB` (پیش‌فرض: `15`)
+- `REDIS_FLUSHDB` (پیش‌فرض: `1` برای پاک‌سازی قبل از هر بنچ)
 
-می‌توانید دسته‌ای از هندلرها را با پیشوند مشترک ثبت کنید:
-
-```go
-g := app.Group("billing")
-g.OnTask("NEW_ORDER", taskHandler)        // billing.NEW_ORDER
-g.OnEvent("user_events", eventHandler)    // billing.user_events
-g.OnRequest("GET_USER_INFO", rpcHandler)  // billing.GET_USER_INFO
-```
+> توجه: مود **Reliable** امن‌تر است ولی به‌دلیل Subscribe موقتی روی هر درخواست، کندتر از **Fast** خواهد بود.
 
 ---
 
-## نکات مهم: پایداری، همزمانی، توقف
+## عیب‌یابی (Troubleshooting)
 
-- **همزمانی:** خوانش هر بار `Count=1` است ولی هر پیام در goroutine جداگانه اجرا می‌شود و توسط `WithMaxJobs` محدود می‌گردد.
-- **توقف:** با لغو `ctx` حلقه‌های خوانش متوقف می‌شوند، ولی goroutineهای درحال‌اجرای هندلر تا اتمام ادامه می‌دهند (انتظار صریح برای آن‌ها وجود ندارد).
-- **ACK روی خطا:** چون ACK بدون شرط انجام می‌شود، برای Retry باید منطق خودتان را اضافه کنید (مثلاً re-enqueue یا DLQ در لایهٔ اپ).
-- **Events:** خطای هندلر Event لاگ/مدیریت داخلی ندارد—در صورت نیاز خودتان لاگ کنید.
-
----
-
-## یادداشت دربارهٔ examples/
-
-- نمونه‌های موجود با API فعلی همگام نیستند. برای تست از کدهای همین README استفاده کنید.
+- ``** یا **``:
+  - روی کلاینت Pub/Sub (مود Fast)، `ReadTimeout=0` بگذار.
+  - ترتیب بستن: ابتدا `app.Close()` سپس `redis.Close()`.
+- **«نه تایم‌اوت، نه خروجی» در RPC**:
+  - مطمئن شو `reply_to` و `correlation_id` در درخواست تنظیم شده و سرور روی **همان کانال** publish می‌کند.
+  - در مود Fast، سابسکرایبر سراسری (`ensureReplySubscriber`) باید فعال باشد؛ در `RequestFast` به‌صورت خودکار فعال می‌شود.
+  - اگر لازمه با `redis-cli MONITOR` مسیر پیام را بررسی کن.
 
 ---
 
-## مشارکت و لایسنس
+## لایسنس
 
-پیشنهادها و PRها خوش‌آمدند. لایسنس: MIT.
+MIT (یا طبق فایل LICENSE ریپو)
 
+---
+
+## نگهداری‌کننده
+
+- @mrjvadi — هر پیشنهادی داشتی خوشحال می‌شیم!
