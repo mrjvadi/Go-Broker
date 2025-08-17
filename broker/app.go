@@ -5,15 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
-	"os"
-	"sync"
-	"time"
 )
 
-// App ساختار اصلی و مرکزی فریمورک است.
 type App struct {
 	client            *redis.Client
 	logger            *zap.Logger
@@ -25,19 +28,25 @@ type App struct {
 	rpcHandlers       map[string]RPCHandlerFunc
 	maxConcurrentJobs int
 	streamMaxLen      int64
+
+	replyOnce    sync.Once
+	replySub     *redis.PubSub
+	replyMu      sync.Mutex
+	replyWaiters map[string]chan *redis.Message
+
+	shutdownOnce sync.Once
+	shutdownCh   chan struct{}
 }
 
-// Group یک ساختار برای گروه‌بندی پردازشگرها با یک پیشوند مشترک است.
 type Group struct {
 	app    *App
 	prefix string
 }
 
-// New یک نمونه جدید از اپلیکیشن را با تنظیمات اولیه و گزینه‌های اختیاری می‌سازد.
 func New(client *redis.Client, stream, group string, options ...Option) *App {
 	hostname, _ := os.Hostname()
 	consumerName := fmt.Sprintf("%s-%d", hostname, os.Getpid())
-	app := &App{
+	return &App{
 		client:            client,
 		streamName:        stream,
 		groupName:         group,
@@ -45,37 +54,25 @@ func New(client *redis.Client, stream, group string, options ...Option) *App {
 		taskHandlers:      make(map[string]HandlerFunc),
 		eventHandlers:     make(map[string]HandlerFunc),
 		rpcHandlers:       make(map[string]RPCHandlerFunc),
-		maxConcurrentJobs: 10,
+		maxConcurrentJobs: 50,
 		logger:            zap.NewNop(),
+		replyWaiters:      make(map[string]chan *redis.Message),
+		shutdownCh:        make(chan struct{}),
 	}
-	for _, option := range options {
-		option(app)
-	}
-	return app
 }
 
-// Group یک گروه جدید برای ثبت پردازشگرها با پیشوند مشترک ایجاد می‌کند.
 func (a *App) Group(prefix string) *Group {
-	return &Group{
-		app:    a,
-		prefix: prefix,
-	}
+	return &Group{app: a, prefix: prefix}
 }
-
-// --- متدهای ارسال پیام ---
 
 func (a *App) Enqueue(ctx context.Context, taskType string, payload interface{}) (string, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("could not marshal payload: %w", err)
 	}
-	values := map[string]interface{}{"type": taskType, "payload": string(payloadBytes)}
-	return a.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: a.streamName,
-		Values: values,
-		MaxLen: a.streamMaxLen,
-		Approx: true,
-	}).Result()
+	keys := []string{a.streamName}
+	args := []interface{}{"task", taskType, string(payloadBytes), "", ""}
+	return enqueueLua.Run(ctx, a.client, keys, args...).String(), err
 }
 
 func (a *App) Publish(ctx context.Context, channel string, payload interface{}) error {
@@ -83,34 +80,37 @@ func (a *App) Publish(ctx context.Context, channel string, payload interface{}) 
 	if err != nil {
 		return fmt.Errorf("could not marshal payload: %w", err)
 	}
-	return a.client.Publish(ctx, channel, payloadBytes).Err()
+	keys := []string{channel}
+	return publishLua.Run(ctx, a.client, keys, payloadBytes).Err()
 }
 
 func (a *App) Request(ctx context.Context, taskType string, payload interface{}, timeout time.Duration) ([]byte, error) {
+	a.ensureReplySubscriber(ctx)
 	correlationID := uuid.NewString()
 	replyToChannel := fmt.Sprintf("reply:%s", correlationID)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("could not marshal payload: %w", err)
 	}
-	pubsub := a.client.Subscribe(ctx, replyToChannel)
-	defer pubsub.Close()
-	values := map[string]interface{}{
-		"type":           taskType,
-		"payload":        string(payloadBytes),
-		"reply_to":       replyToChannel,
-		"correlation_id": correlationID,
-	}
-	if _, err := a.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: a.streamName,
-		Values: values,
-		MaxLen: a.streamMaxLen,
-		Approx: true,
-	}).Result(); err != nil {
+
+	ch := make(chan *redis.Message, 1)
+	a.replyMu.Lock()
+	a.replyWaiters[correlationID] = ch
+	a.replyMu.Unlock()
+	defer func() {
+		a.replyMu.Lock()
+		delete(a.replyWaiters, correlationID)
+		a.replyMu.Unlock()
+	}()
+
+	keys := []string{a.streamName}
+	args := []interface{}{"rpc", taskType, string(payloadBytes), replyToChannel, correlationID}
+	if _, err := enqueueLua.Run(ctx, a.client, keys, args...).Result(); err != nil {
 		return nil, fmt.Errorf("could not enqueue request: %w", err)
 	}
+
 	select {
-	case msg := <-pubsub.Channel():
+	case msg := <-ch:
 		return []byte(msg.Payload), nil
 	case <-time.After(timeout):
 		return nil, errors.New("request timed out")
@@ -119,12 +119,9 @@ func (a *App) Request(ctx context.Context, taskType string, payload interface{},
 	}
 }
 
-// --- متدهای ثبت پردازشگر در سطح App ---
 func (a *App) OnTask(taskType string, handler HandlerFunc)       { a.taskHandlers[taskType] = handler }
 func (a *App) OnEvent(channel string, handler HandlerFunc)       { a.eventHandlers[channel] = handler }
 func (a *App) OnRequest(taskType string, handler RPCHandlerFunc) { a.rpcHandlers[taskType] = handler }
-
-// --- متدهای ثبت پردازشگر در سطح Group ---
 func (g *Group) OnTask(taskType string, handler HandlerFunc) {
 	g.app.OnTask(fmt.Sprintf("%s.%s", g.prefix, taskType), handler)
 }
@@ -135,13 +132,57 @@ func (g *Group) OnRequest(taskType string, handler RPCHandlerFunc) {
 	g.app.OnRequest(fmt.Sprintf("%s.%s", g.prefix, taskType), handler)
 }
 
-// --- متد اجرای ورکر ---
-func (a *App) Run(ctx context.Context) {
+func (a *App) Run() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	a.logger.Info("Worker App starting...")
+	a.ensureReplySubscriber(ctx)
+
 	wg.Add(2)
 	go a.runTaskProcessor(ctx, &wg)
 	go a.runEventSubscriber(ctx, &wg)
+
+	<-ctx.Done()
+	a.Close() // Trigger graceful shutdown
 	wg.Wait()
-	a.logger.Info("Worker App has shut down.")
+	a.logger.Info("Worker App has shut down gracefully.")
+}
+
+func (a *App) Close() {
+	a.shutdownOnce.Do(func() {
+		close(a.shutdownCh)
+		if a.replySub != nil {
+			a.replySub.Close()
+		}
+	})
+}
+
+func (a *App) ensureReplySubscriber(ctx context.Context) {
+	a.replyOnce.Do(func() {
+		a.replySub = a.client.PSubscribe(ctx, "reply:*")
+		go a.dispatchReplies(ctx)
+	})
+}
+
+func (a *App) dispatchReplies(ctx context.Context) {
+	ch := a.replySub.Channel()
+	for {
+		select {
+		case <-a.shutdownCh:
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			correlationID := strings.TrimPrefix(msg.Channel, "reply:")
+			a.replyMu.Lock()
+			waiter, found := a.replyWaiters[correlationID]
+			a.replyMu.Unlock()
+			if found {
+				waiter <- msg
+			}
+		}
+	}
 }
