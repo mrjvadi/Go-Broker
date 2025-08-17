@@ -2,238 +2,146 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"strings"
-	"sync"
-	"time"
-
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"os"
+	"sync"
+	"time"
 )
 
+// App ساختار اصلی و مرکزی فریمورک است.
 type App struct {
-	rdb    *redis.Client
-	stream string
-	group  string
-
-	// رجیستری هندلرها
-	mu            sync.RWMutex
-	taskHandlers  map[string]HandlerFunc
-	eventHandlers map[string]HandlerFunc
-	rpcHandlers   map[string]RPCHandlerFunc
-	eventSubs     map[string]*redis.PubSub
-
-	// اجرای داخلی
-	startOnce    sync.Once
-	started      bool
-	wg           sync.WaitGroup
-	sem          chan struct{} // سقف همزمانی هندلرها
-	maxJobs      int
-	pollBlock    time.Duration
-	streamMaxLen int64
-
-	// لاگ
-	logger *zap.Logger
-
-	consumerID string
-
-	// ---------- برای مود Fast (best-effort) ----------
-	replyOnce    sync.Once
-	replyCtx     context.Context
-	replyCancel  context.CancelFunc
-	replySub     *redis.PubSub
-	replyMu      sync.Mutex
-	replyWaiters map[string]chan []byte // corrID -> result chan
-	replyEarly   map[string][]byte      // پاسخ‌های زودرس
+	client            *redis.Client
+	logger            *zap.Logger
+	streamName        string
+	groupName         string
+	consumerName      string
+	taskHandlers      map[string]HandlerFunc
+	eventHandlers     map[string]HandlerFunc
+	rpcHandlers       map[string]RPCHandlerFunc
+	maxConcurrentJobs int
+	streamMaxLen      int64
 }
 
+// Group یک ساختار برای گروه‌بندی پردازشگرها با یک پیشوند مشترک است.
+type Group struct {
+	app    *App
+	prefix string
+}
+
+// New یک نمونه جدید از اپلیکیشن را با تنظیمات اولیه و گزینه‌های اختیاری می‌سازد.
 func New(client *redis.Client, stream, group string, options ...Option) *App {
-	a := &App{
-		rdb:           client,
-		stream:        stream,
-		group:         group,
-		taskHandlers:  make(map[string]HandlerFunc),
-		eventHandlers: make(map[string]HandlerFunc),
-		rpcHandlers:   make(map[string]RPCHandlerFunc),
-		eventSubs:     make(map[string]*redis.PubSub),
-		maxJobs:       10,
-		pollBlock:     2 * time.Second,
-		streamMaxLen:  0,
-		logger:        zap.NewNop(),
-		consumerID:    defaultConsumerID(),
-
-		replyWaiters: make(map[string]chan []byte),
-		replyEarly:   make(map[string][]byte),
+	hostname, _ := os.Hostname()
+	consumerName := fmt.Sprintf("%s-%d", hostname, os.Getpid())
+	app := &App{
+		client:            client,
+		streamName:        stream,
+		groupName:         group,
+		consumerName:      consumerName,
+		taskHandlers:      make(map[string]HandlerFunc),
+		eventHandlers:     make(map[string]HandlerFunc),
+		rpcHandlers:       make(map[string]RPCHandlerFunc),
+		maxConcurrentJobs: 10,
+		logger:            zap.NewNop(),
 	}
-	a.sem = make(chan struct{}, a.maxJobs)
-	for _, opt := range options {
-		opt(a)
+	for _, option := range options {
+		option(app)
 	}
-	return a
+	return app
 }
 
-// ثبت هندلرها
-func (a *App) OnTask(name string, h HandlerFunc) {
-	a.mu.Lock()
-	a.taskHandlers[name] = h
-	a.mu.Unlock()
-}
-
-func (a *App) OnEvent(channel string, h HandlerFunc) {
-	a.mu.Lock()
-	a.eventHandlers[channel] = h
-	started := a.started
-	a.mu.Unlock()
-	if started {
-		a.startEventSubscriber(channel, h)
+// Group یک گروه جدید برای ثبت پردازشگرها با پیشوند مشترک ایجاد می‌کند.
+func (a *App) Group(prefix string) *Group {
+	return &Group{
+		app:    a,
+		prefix: prefix,
 	}
 }
 
-func (a *App) OnRequest(name string, h RPCHandlerFunc) {
-	a.mu.Lock()
-	a.rpcHandlers[name] = h
-	a.mu.Unlock()
+// --- متدهای ارسال پیام ---
+
+func (a *App) Enqueue(ctx context.Context, taskType string, payload interface{}) (string, error) {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("could not marshal payload: %w", err)
+	}
+	values := map[string]interface{}{"type": taskType, "payload": string(payloadBytes)}
+	return a.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: a.streamName,
+		Values: values,
+		MaxLen: a.streamMaxLen,
+		Approx: true,
+	}).Result()
 }
 
-// Run بلوکه می‌ماند تا ctx لغو شود.
+func (a *App) Publish(ctx context.Context, channel string, payload interface{}) error {
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("could not marshal payload: %w", err)
+	}
+	return a.client.Publish(ctx, channel, payloadBytes).Err()
+}
+
+func (a *App) Request(ctx context.Context, taskType string, payload interface{}, timeout time.Duration) ([]byte, error) {
+	correlationID := uuid.NewString()
+	replyToChannel := fmt.Sprintf("reply:%s", correlationID)
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("could not marshal payload: %w", err)
+	}
+	pubsub := a.client.Subscribe(ctx, replyToChannel)
+	defer pubsub.Close()
+	values := map[string]interface{}{
+		"type":           taskType,
+		"payload":        string(payloadBytes),
+		"reply_to":       replyToChannel,
+		"correlation_id": correlationID,
+	}
+	if _, err := a.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: a.streamName,
+		Values: values,
+		MaxLen: a.streamMaxLen,
+		Approx: true,
+	}).Result(); err != nil {
+		return nil, fmt.Errorf("could not enqueue request: %w", err)
+	}
+	select {
+	case msg := <-pubsub.Channel():
+		return []byte(msg.Payload), nil
+	case <-time.After(timeout):
+		return nil, errors.New("request timed out")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// --- متدهای ثبت پردازشگر در سطح App ---
+func (a *App) OnTask(taskType string, handler HandlerFunc)       { a.taskHandlers[taskType] = handler }
+func (a *App) OnEvent(channel string, handler HandlerFunc)       { a.eventHandlers[channel] = handler }
+func (a *App) OnRequest(taskType string, handler RPCHandlerFunc) { a.rpcHandlers[taskType] = handler }
+
+// --- متدهای ثبت پردازشگر در سطح Group ---
+func (g *Group) OnTask(taskType string, handler HandlerFunc) {
+	g.app.OnTask(fmt.Sprintf("%s.%s", g.prefix, taskType), handler)
+}
+func (g *Group) OnEvent(channel string, handler HandlerFunc) {
+	g.app.OnEvent(fmt.Sprintf("%s.%s", g.prefix, channel), handler)
+}
+func (g *Group) OnRequest(taskType string, handler RPCHandlerFunc) {
+	g.app.OnRequest(fmt.Sprintf("%s.%s", g.prefix, taskType), handler)
+}
+
+// --- متد اجرای ورکر ---
 func (a *App) Run(ctx context.Context) {
-	a.startOnce.Do(func() {
-		a.mu.Lock()
-		a.started = true
-		a.mu.Unlock()
-
-		// ایجاد Consumer Group اگر وجود ندارد
-		if err := a.rdb.XGroupCreateMkStream(ctx, a.stream, a.group, "$").Err(); err != nil && !isGroupExists(err) {
-			a.logf("XGroupCreateMkStream error: %v", err)
-		}
-
-		// استارت مصرف Stream برای Task/RPC
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			a.consumeStream(ctx)
-		}()
-
-		// استارت subscriber برای Eventهای از قبل ثبت‌شده
-		a.mu.RLock()
-		for ch, h := range a.eventHandlers {
-			a.startEventSubscriber(ch, h)
-		}
-		a.mu.RUnlock()
-	})
-
-	// بلوکه تا لغو
-	<-ctx.Done()
-
-	// خاموشی تمیز
-	a.closeEventSubs()
-	a.closeReplySub()
-	a.wg.Wait()
-}
-
-func (a *App) Close() error {
-	a.closeEventSubs()
-	a.closeReplySub()
-	a.wg.Wait()
-	return nil
-}
-
-// ---------- داخلی ----------
-
-func isGroupExists(err error) bool {
-	if err == nil {
-		return false
-	}
-	return false
-}
-
-func (a *App) withConcurrency(fn func()) {
-	a.sem <- struct{}{}
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		defer func() { <-a.sem }()
-		fn()
-	}()
-}
-
-func (a *App) logf(format string, args ...any) {
-	if a.logger != nil {
-		a.logger.Sugar().Infof(format, args...)
-	}
-}
-
-func defaultConsumerID() string {
-	host, _ := os.Hostname()
-	if host == "" {
-		host = "host"
-	}
-	return fmt.Sprintf("%s-%d", host, os.Getpid())
-}
-
-// ---------- PSubscribe پاسخ‌های RPC برای مود Fast ----------
-func (a *App) ensureReplySubscriber() {
-	a.replyOnce.Do(func() {
-		a.replyCtx, a.replyCancel = context.WithCancel(context.Background())
-		a.replySub = a.rdb.PSubscribe(a.replyCtx, "reply:*")
-
-		// کانال با بافر بزرگ برای جلوگیری از drop
-		ch := a.replySub.Channel(redis.WithChannelSize(4096))
-
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			defer func() { _ = a.replySub.Close() }()
-
-			for msg := range ch {
-				id := extractReplyID(msg.Channel) // "reply:<id>" → "<id>"
-				if id == "" {
-					continue
-				}
-
-				// تحویل قبل از حذف (با fallback غیرمسدودکننده)
-				a.replyMu.Lock()
-				waiter, ok := a.replyWaiters[id]
-				a.replyMu.Unlock()
-
-				if ok {
-					payload := []byte(msg.Payload)
-					delivered := false
-					select {
-					case waiter <- payload:
-						delivered = true
-					default:
-						// اگر نادر بود و جا نشد، در پس‌زمینه ارسال کن
-						go func(ch chan []byte, p []byte) { ch <- p }(waiter, payload)
-						delivered = true
-					}
-					if delivered {
-						a.replyMu.Lock()
-						delete(a.replyWaiters, id)
-						a.replyMu.Unlock()
-					}
-				} else {
-					// پاسخ زودرس—هنوز منتظری ثبت نشده
-					a.replyMu.Lock()
-					a.replyEarly[id] = []byte(msg.Payload)
-					a.replyMu.Unlock()
-				}
-			}
-		}()
-	})
-}
-
-func (a *App) closeReplySub() {
-	if a.replyCancel != nil {
-		a.replyCancel()
-	}
-}
-
-func extractReplyID(channel string) string {
-	const p = "reply:"
-	if strings.HasPrefix(channel, p) && len(channel) > len(p) {
-		return channel[len(p):]
-	}
-	return ""
+	var wg sync.WaitGroup
+	a.logger.Info("Worker App starting...")
+	wg.Add(2)
+	go a.runTaskProcessor(ctx, &wg)
+	go a.runEventSubscriber(ctx, &wg)
+	wg.Wait()
+	a.logger.Info("Worker App has shut down.")
 }

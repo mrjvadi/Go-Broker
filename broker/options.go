@@ -1,43 +1,29 @@
 package broker
 
-import (
-	"time"
+import "go.uber.org/zap"
 
-	"go.uber.org/zap"
-)
-
+// Option یک نوع داده برای توابع پیکربندی اختیاری است.
 type Option func(*App)
 
-func WithLogger(l *zap.Logger) Option {
+// WithLogger یک گزینه برای تنظیم لاگر سفارشی است.
+func WithLogger(logger *zap.Logger) Option {
 	return func(a *App) {
-		if l != nil {
-			a.logger = l
-		}
+		a.logger = logger
 	}
 }
 
+// WithMaxJobs یک گزینه برای تنظیم حداکثر کارهای همزمان است.
 func WithMaxJobs(n int) Option {
 	return func(a *App) {
 		if n > 0 {
-			a.maxJobs = n
-			a.sem = make(chan struct{}, a.maxJobs)
+			a.maxConcurrentJobs = n
 		}
 	}
 }
 
+// WithStreamLength یک گزینه برای تنظیم حداکثر طول استریم است.
 func WithStreamLength(n int64) Option {
 	return func(a *App) {
-		if n >= 0 {
-			a.streamMaxLen = n
-		}
-	}
-}
-
-// (اختیاری) تغییر مدت بلاک XREADGROUP
-func withPollBlock(d time.Duration) Option {
-	return func(a *App) {
-		if d > 0 {
-			a.pollBlock = d
-		}
+		a.streamMaxLen = n
 	}
 }
